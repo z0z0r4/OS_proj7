@@ -149,6 +149,7 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   int cwdh;                    // Current directory: file system server handle
   int cwdgen;                  //   ... and the server incarnation that issued it
+  int cwdstale;                // cwd was lost on fork: relative paths must fail
   int svcid;                   // service this process may register as (boot module)
   int boot;                    // boot module to run on first schedule (0 = none)
   struct proc *xfer_client;    // server only: client whose buffer it is serving

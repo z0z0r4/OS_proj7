@@ -32,7 +32,8 @@ enum {
   FS_UMOUNT,     // s1=path
 };
 
-// svc_xfer() directions
+// svc_xfer() directions: a closed set.  sys_svc_xfer() rejects any other
+// value, and a new direction must be added to its whitelist explicitly.
 #define XFER_TO_CLIENT   0
 #define XFER_FROM_CLIENT 1
 

@@ -17,7 +17,7 @@
 
 // Send a request with up to two path arguments to the file system server.
 static long
-pathcall(int op, char *s1, char *s2, uint64 a0, uint64 a1)
+pathcall(int op, char *s1, char *s2, uint64 a0, uint64 a1, int *callgen)
 {
   struct ipcmsg m;
 
@@ -29,7 +29,7 @@ pathcall(int op, char *s1, char *s2, uint64 a0, uint64 a1)
     safestrcpy(m.s2, s2, sizeof(m.s2));
   m.a0 = a0;
   m.a1 = a1;
-  return fs_call(&m, 0, 0, 0);
+  return fs_call(&m, 0, 0, 0, callgen);
 }
 
 uint64
@@ -43,7 +43,7 @@ sys_mount(void)
     return -1;
   argint(2, &dev);
 
-  return pathcall(FS_MOUNT, fstype, path, dev, 0);
+  return pathcall(FS_MOUNT, fstype, path, dev, 0, 0);
 }
 
 uint64
@@ -53,7 +53,7 @@ sys_umount(void)
 
   if(argstr(0, path, MAXPATH) < 0)
     return -1;
-  return pathcall(FS_UMOUNT, path, 0, 0, 0);
+  return pathcall(FS_UMOUNT, path, 0, 0, 0, 0);
 }
 
 // Fetch the nth word-sized system call argument as a file descriptor
@@ -167,7 +167,7 @@ sys_link(void)
 
   if(argstr(0, old, MAXPATH) < 0 || argstr(1, new, MAXPATH) < 0)
     return -1;
-  return pathcall(FS_LINK, old, new, 0, 0);
+  return pathcall(FS_LINK, old, new, 0, 0, 0);
 }
 
 uint64
@@ -177,14 +177,14 @@ sys_unlink(void)
 
   if(argstr(0, path, MAXPATH) < 0)
     return -1;
-  return pathcall(FS_UNLINK, path, 0, 0, 0);
+  return pathcall(FS_UNLINK, path, 0, 0, 0, 0);
 }
 
 uint64
 sys_open(void)
 {
   char path[MAXPATH];
-  int fd, omode, gen;
+  int fd, omode, gen = 0;
   struct file *f;
   struct ipcmsg m;
   long h;
@@ -197,8 +197,7 @@ sys_open(void)
   m.op = FS_OPEN;
   safestrcpy(m.s1, path, sizeof(m.s1));
   m.a0 = omode;
-  gen = svc_gen(SVC_FS);
-  if((h = fs_call(&m, 0, 0, 0)) <= 0)
+  if((h = fs_call(&m, 0, 0, 0, &gen)) <= 0)
     return -1;
 
   if(m.r1 == T_DEVICE && (m.r2 < 0 || m.r2 >= NDEV)){
@@ -233,7 +232,7 @@ sys_mkdir(void)
 
   if(argstr(0, path, MAXPATH) < 0)
     return -1;
-  return pathcall(FS_MKDIR, path, 0, 0, 0);
+  return pathcall(FS_MKDIR, path, 0, 0, 0, 0);
 }
 
 uint64
@@ -246,7 +245,7 @@ sys_mknod(void)
   argint(2, &minor);
   if(argstr(0, path, MAXPATH) < 0)
     return -1;
-  return pathcall(FS_MKNOD, path, 0, major, minor);
+  return pathcall(FS_MKNOD, path, 0, major, minor, 0);
 }
 
 uint64
@@ -254,17 +253,17 @@ sys_chdir(void)
 {
   char path[MAXPATH];
   struct proc *p = myproc();
-  int gen;
+  int gen = 0;
   long h;
 
   if(argstr(0, path, MAXPATH) < 0)
     return -1;
-  gen = svc_gen(SVC_FS);
-  if((h = pathcall(FS_CHDIR, path, 0, 0, 0)) <= 0)
+  if((h = pathcall(FS_CHDIR, path, 0, 0, 0, &gen)) <= 0)
     return -1;
   fs_release(p->cwdh, p->cwdgen);
   p->cwdh = h;
   p->cwdgen = gen;
+  p->cwdstale = 0;
   return 0;
 }
 

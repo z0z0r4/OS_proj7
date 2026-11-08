@@ -14,6 +14,24 @@
 #include "buf.h"
 #include "ipc.h"
 
+extern struct proc *initproc;
+
+#ifdef P0_TEST_HOOKS
+// Test-only: while set, init is held inside svc_restart so that the restart
+// authorization check can be observed deterministically while the service is
+// down.  Accessed only through the __atomic builtins (cross-CPU shared).
+static int svc_hold;
+
+// Test-only: deterministic generation race.  A client arms genrace_pid with
+// svc_restart(-3); the next file system ipc_call from that pid consumes it
+// once, kills the current server and waits for a new incarnation to
+// register, so the request is admitted against the new generation.
+// genrace_state is reported through svc_restart(-4): 1 armed, 2 restart
+// observed, -1 the hook could not observe a restart.
+static int genrace_pid;
+static int genrace_state;
+#endif
+
 struct svc {
   struct spinlock lock;
   struct proc *server;      // registered server, 0 = service down
@@ -39,7 +57,14 @@ ipcinit(void)
 int
 svc_gen(int id)
 {
-  return svc[id].gen;
+  int g;
+
+  if(id <= 0 || id >= NSVC)
+    return 0;
+  acquire(&svc[id].lock);
+  g = svc[id].gen;
+  release(&svc[id].lock);
+  return g;
 }
 
 int
@@ -55,18 +80,78 @@ svc_serverpid(int id)
   return s ? s->pid : 0;
 }
 
+#ifdef P0_TEST_HOOKS
+// Run by the armed client at the top of ipc_call, before the request is
+// admitted: kill the current server and wait, without holding svc.lock or
+// tickslock across kkill/yield, until a new incarnation has registered.
+// The caller's request is then admitted against that new generation.
+static void
+ipc_genrace_hook(int id, struct proc *p)
+{
+  struct svc *s;
+  int expected, old, cur;
+  uint start, now;
+
+  if(id != SVC_FS)
+    return;
+  expected = p->pid;
+  if(!__atomic_compare_exchange_n(&genrace_pid, &expected, 0, 0,
+                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    return;
+  s = &svc[id];
+  acquire(&s->lock);
+  old = s->server ? s->server->pid : 0;
+  release(&s->lock);
+  if(old <= 0){
+    __atomic_store_n(&genrace_state, -1, __ATOMIC_RELEASE);
+    return;
+  }
+  kkill(old);
+  acquire(&tickslock);
+  start = ticks;
+  release(&tickslock);
+  cur = 0;
+  for(;;){
+    acquire(&s->lock);
+    cur = s->server ? s->server->pid : 0;
+    release(&s->lock);
+    if(cur > 0 && cur != old)
+      break;
+    if(killed(p))
+      break;
+    acquire(&tickslock);
+    now = ticks;
+    release(&tickslock);
+    if(now - start >= 100)      // bounded; normal restart is much faster
+      break;
+    yield();
+  }
+  __atomic_store_n(&genrace_state, (cur > 0 && cur != old) ? 2 : -1,
+                   __ATOMIC_RELEASE);
+}
+#endif
+
 // Send m to service id and wait for the reply.  The client's buffer
 // [gaddr, gaddr+glen) (user address, or kernel address if gkernel) is
 // made accessible to the server for the duration of the call.
-// Returns m->ret, or -1 if the service is down, died, or the handle in
-// m->gen belongs to a previous incarnation.
+// If callgen is set, it receives the generation of the server incarnation
+// that admitted the request (0 if it was never admitted).  Returns m->ret,
+// or -1 if the service is down, died, or the handle in m->gen belongs to a
+// previous incarnation.
 long
-ipc_call(int id, struct ipcmsg *m, uint64 gaddr, uint64 glen, int gkernel)
+ipc_call(int id, struct ipcmsg *m, uint64 gaddr, uint64 glen, int gkernel,
+         int *callgen)
 {
   struct svc *s = &svc[id];
   struct proc *p = myproc();
   long ret;
+  int serving = 0;
 
+  if(callgen)
+    *callgen = 0;
+#ifdef P0_TEST_HOOKS
+  ipc_genrace_hook(id, p);
+#endif
   m->pid = p->pid;
   m->gaddr = gaddr;
   m->glen = glen;
@@ -80,6 +165,9 @@ ipc_call(int id, struct ipcmsg *m, uint64 gaddr, uint64 glen, int gkernel)
       break;
     sleep(&s->busy, &s->lock);
   }
+  // Admitted: the server pointer and generation were just checked under the
+  // lock, so capture the serving incarnation in the same critical section.
+  serving = s->gen;
   s->busy = 1;
   s->client = p;
   s->req = m;
@@ -100,6 +188,8 @@ ipc_call(int id, struct ipcmsg *m, uint64 gaddr, uint64 glen, int gkernel)
   s->req = 0;
   wakeup(&s->busy);
   release(&s->lock);
+  if(callgen)
+    *callgen = serving;
   return ret;
 }
 
@@ -126,6 +216,14 @@ ipc_proc_exit(struct proc *p)
     }
     release(&s->lock);
   }
+#ifdef P0_TEST_HOOKS
+  {
+    int expected = p->pid;
+    if(__atomic_compare_exchange_n(&genrace_pid, &expected, 0, 0,
+                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      __atomic_store_n(&genrace_state, -1, __ATOMIC_RELEASE);
+  }
+#endif
   p->xfer_client = 0;
 }
 
@@ -149,7 +247,10 @@ sys_svc_register(void)
     return -1;
   }
   s->server = myproc();
-  s->gen++;
+  if(s->gen == 0x7fffffff)
+    s->gen = 1;
+  else
+    s->gen++;
   release(&s->lock);
   return s->gen;
 }
@@ -227,20 +328,28 @@ sys_svc_reply(void)
 uint64
 sys_svc_xfer(void)
 {
-  int id, dir, n;
-  uint64 caddr, buf;
+  int id, n;
+  uint64 dir, caddr, buf, n64;
   struct svc *s;
   struct proc *p = myproc(), *c;
   char tmp[256];
   int gkernel;
-  uint64 gaddr, glen;
+  uint64 gaddr, glen, off;
 
   argint(0, &id);
-  argint(1, &dir);
+  argaddr(1, &dir);
   argaddr(2, &caddr);
   argaddr(3, &buf);
-  argint(4, &n);
-  if(id <= 0 || id >= NSVC || n < 0)
+  argaddr(4, &n64);
+  // Directions are a closed set: anything else must not touch any buffer.
+  if(dir != XFER_TO_CLIENT && dir != XFER_FROM_CLIENT)
+    return -1;
+  // Length is a 32-bit signed protocol field.  Reject any value that
+  // would not survive the cast, including sign-extended negatives.
+  if(n64 > 0x7fffffffULL)
+    return -1;
+  n = (int)n64;
+  if(id <= 0 || id >= NSVC)
     return -1;
   s = &svc[id];
   acquire(&s->lock);
@@ -254,7 +363,15 @@ sys_svc_xfer(void)
   gkernel = s->gkernel;
   release(&s->lock);
 
-  if(caddr < gaddr || caddr + n < caddr || caddr + n > gaddr + glen)
+  // A wrapping grant has no representable end; reject it before any
+  // subtraction-based containment test.
+  if(glen > ~0ULL - gaddr)
+    return -1;
+  // [caddr, caddr+n) must lie inside [gaddr, gaddr+glen).
+  if(caddr < gaddr)
+    return -1;
+  off = caddr - gaddr;
+  if(off > glen || (uint64)n > glen - off)
     return -1;
   while(n > 0){
     int m = n > (int)sizeof(tmp) ? (int)sizeof(tmp) : n;
@@ -335,21 +452,122 @@ uint64
 sys_svc_restart(void)
 {
   int id;
+  struct proc *p = myproc();
+
   argint(0, &id);
-  if(id != SVC_FS || svc[id].server != 0)
+#ifdef P0_TEST_HOOKS
+  if(id == -2){
+    __atomic_store_n(&svc_hold, 1, __ATOMIC_RELEASE);
+    return 0;
+  }
+  if(id == -1){
+    __atomic_store_n(&svc_hold, 0, __ATOMIC_RELEASE);
+    return 0;
+  }
+  if(id == -3){
+    // Arm a one-shot generation race: this process's next file system IPC
+    // restarts the server before the request is admitted.
+    __atomic_store_n(&genrace_pid, p->pid, __ATOMIC_RELEASE);
+    __atomic_store_n(&genrace_state, 1, __ATOMIC_RELEASE);
+    return 0;
+  }
+  if(id == -4)
+    return __atomic_load_n(&genrace_state, __ATOMIC_ACQUIRE);
+  if(p == initproc && __atomic_load_n(&svc_hold, __ATOMIC_ACQUIRE)){
+    uint start, now;
+    acquire(&tickslock);
+    start = ticks;
+    release(&tickslock);
+    while(__atomic_load_n(&svc_hold, __ATOMIC_ACQUIRE)){
+      acquire(&tickslock);
+      now = ticks;
+      release(&tickslock);
+      if(now - start >= 300)   // bounded; the test releases the hold much earlier
+        break;
+      yield();
+    }
+  }
+#endif
+  // Only init supervises the file system service.  Without this, any process
+  // could spawn a second server while the service is down, and the loser of
+  // the registration race panics.
+  if(p != initproc)
+    return -1;
+  if(id != SVC_FS)
+    return -1;
+  if(svc[SVC_FS].server != 0)
     return -1;
   return spawn_fsserver();
 }
 
 // ---- file system client helpers (used by the system call layer) ----
 
+enum { FS_CWD_NONE, FS_CWD_ABS, FS_CWD_REL, FS_CWD_INVALID };
+
+// How does this request use the caller's current directory?
+static int
+fs_cwd_need(struct ipcmsg *m)
+{
+  switch(m->op){
+  case FS_READ:
+  case FS_WRITE:
+  case FS_PREAD:
+  case FS_STAT:
+  case FS_CLOSE:
+  case FS_DUP:
+    return FS_CWD_NONE;
+  case FS_OPEN:
+  case FS_UNLINK:
+  case FS_MKDIR:
+  case FS_MKNOD:
+  case FS_CHDIR:
+  case FS_UMOUNT:
+    return m->s1[0] == '/' ? FS_CWD_ABS : FS_CWD_REL;
+  case FS_LINK:
+    return (m->s1[0] == '/' && m->s2[0] == '/') ? FS_CWD_ABS : FS_CWD_REL;
+  case FS_MOUNT:
+    return m->s2[0] == '/' ? FS_CWD_ABS : FS_CWD_REL;
+  default:
+    return FS_CWD_INVALID;      // unknown op: never guess a cwd policy
+  }
+}
+
+// Root is exactly (h=0, gen=0).  A usable remote cwd is exactly
+// (h>0, gen>0).  Anything else is a lost or inconsistent handle: relative
+// names must fail instead of silently resolving from the root.
+static int
+fs_cwd_usable(struct proc *p)
+{
+  if(p->cwdstale)
+    return 0;
+  if(p->cwdh == 0)
+    return p->cwdgen == 0;
+  return p->cwdh > 0 && p->cwdgen > 0;
+}
+
 // Call the file system server on behalf of the current process.
 long
-fs_call(struct ipcmsg *m, uint64 gaddr, uint64 glen, int gkernel)
+fs_call(struct ipcmsg *m, uint64 gaddr, uint64 glen, int gkernel, int *callgen)
 {
   struct proc *p = myproc();
-  m->cwd = (p->cwdh && p->cwdgen == svc_gen(SVC_FS)) ? p->cwdh : 0;
-  return ipc_call(SVC_FS, m, gaddr, glen, gkernel);
+  int need = fs_cwd_need(m);
+
+  if(callgen)
+    *callgen = 0;
+  if(need == FS_CWD_NONE){
+    m->cwd = 0;                 // do not touch m->gen: it is the handle generation
+  } else if(need == FS_CWD_INVALID){
+    return -1;                  // fail closed before any IPC
+  } else if(need == FS_CWD_ABS){
+    m->cwd = 0;                 // absolute paths are cwd-independent
+    m->gen = 0;
+  } else {
+    if(!fs_cwd_usable(p))
+      return -1;                // explicit failure, never fall back to root
+    m->cwd = p->cwdh;           // 0 = root, which is incarnation-independent
+    m->gen = p->cwdgen;         // ipc_call rejects under s->lock if stale
+  }
+  return ipc_call(SVC_FS, m, gaddr, glen, gkernel, callgen);
 }
 
 // Drop a server handle; stale handles (dead server) need no message.
@@ -364,7 +582,7 @@ fs_release(int h, int gen)
   m.op = FS_CLOSE;
   m.h = h;
   m.gen = gen;
-  ipc_call(SVC_FS, &m, 0, 0, 0);
+  ipc_call(SVC_FS, &m, 0, 0, 0, 0);
 }
 
 // Give a new process its own reference to p's cwd.
@@ -375,15 +593,28 @@ fs_dup_cwd(struct proc *np, struct proc *p)
 
   np->cwdh = 0;
   np->cwdgen = 0;
-  if(p->cwdh <= 0 || p->cwdgen != svc_gen(SVC_FS))
+  np->cwdstale = 0;
+
+  if(p->cwdstale){
+    np->cwdstale = 1;           // parent already lost its cwd
     return;
+  }
+  if(p->cwdh == 0 && p->cwdgen == 0)
+    return;                     // valid root: nothing to copy
+  if(!fs_cwd_usable(p)){
+    np->cwdstale = 1;           // inconsistent/lost handle: never root
+    return;
+  }
+
   memset(&m, 0, sizeof(m));
   m.op = FS_DUP;
   m.h = p->cwdh;
-  m.gen = p->cwdgen;
-  long h = ipc_call(SVC_FS, &m, 0, 0, 0);
+  m.gen = p->cwdgen;            // >0, so ipc_call compares generations under the lock
+  long h = ipc_call(SVC_FS, &m, 0, 0, 0, 0);
   if(h > 0){
     np->cwdh = h;
     np->cwdgen = p->cwdgen;
+  } else {
+    np->cwdstale = 1;           // stale generation or failed dup: not root
   }
 }

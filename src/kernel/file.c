@@ -100,7 +100,7 @@ filestat(struct file *f, uint64 addr)
     m.op = FS_STAT;
     m.h = f->h;
     m.gen = f->gen;
-    return fs_call(&m, addr, sizeof(st), 0);
+    return fs_call(&m, addr, sizeof(st), 0, 0);
   }
   return -1;
 }
@@ -128,7 +128,7 @@ fileread(struct file *f, uint64 addr, int n)
     m.h = f->h;
     m.gen = f->gen;
     m.a0 = (uint)n;
-    r = fs_call(&m, addr, (uint)n, 0);
+    r = fs_call(&m, addr, (uint)n, 0, 0);
   } else {
     panic("fileread");
   }
@@ -159,7 +159,7 @@ filewrite(struct file *f, uint64 addr, int n)
     m.h = f->h;
     m.gen = f->gen;
     m.a0 = (uint)n;
-    ret = fs_call(&m, addr, (uint)n, 0);
+    ret = fs_call(&m, addr, (uint)n, 0, 0);
   } else {
     panic("filewrite");
   }

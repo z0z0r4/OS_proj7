@@ -36,12 +36,12 @@ int             kexec_image(char*, char*, uint64, char**);
 // ipc.c
 struct ipcmsg;
 void            ipcinit(void);
-long            ipc_call(int, struct ipcmsg*, uint64, uint64, int);
+long            ipc_call(int, struct ipcmsg*, uint64, uint64, int, int*);
 void            ipc_proc_exit(struct proc*);
 int             svc_gen(int);
 int             svc_alive(int);
 int             svc_serverpid(int);
-long            fs_call(struct ipcmsg*, uint64, uint64, int);
+long            fs_call(struct ipcmsg*, uint64, uint64, int, int*);
 void            fs_release(int, int);
 void            fs_dup_cwd(struct proc*, struct proc*);
 

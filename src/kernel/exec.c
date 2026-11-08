@@ -40,7 +40,7 @@ srcread(struct execsrc *src, void *dst, uint off, uint n)
   m.gen = src->gen;
   m.a0 = off;
   m.a1 = n;
-  r = fs_call(&m, (uint64)dst, n, 1);
+  r = fs_call(&m, (uint64)dst, n, 1, 0);
   return r;
 }
 
@@ -70,12 +70,11 @@ kexec(char *path, char **argv)
   int i, slash, ret;
 
   memset(&src, 0, sizeof(src));
-  src.gen = svc_gen(SVC_FS);
   memset(&m, 0, sizeof(m));
   m.op = FS_OPEN;
   safestrcpy(m.s1, path, sizeof(m.s1));
   m.a0 = O_RDONLY;
-  h = fs_call(&m, 0, 0, 0);
+  h = fs_call(&m, 0, 0, 0, &src.gen);
   if(h <= 0 && path[0] != '/'){
     // Bare command names (no '/') fall back to the root directory,
     // so programs installed in "/" work from any working directory.
@@ -90,7 +89,7 @@ kexec(char *path, char **argv)
       m.op = FS_OPEN;
       safestrcpy(m.s1, rootpath, sizeof(m.s1));
       m.a0 = O_RDONLY;
-      h = fs_call(&m, 0, 0, 0);
+      h = fs_call(&m, 0, 0, 0, &src.gen);
     }
   }
   if(h <= 0)

@@ -18,6 +18,9 @@
 #include "defs.h"
 #include "file.h"
 #include "svcapi.h"
+#ifdef P0_TEST_HOOKS
+#include "syscall.h"
+#endif
 
 // A handle names one reference to an inode held on behalf of a client:
 // an open file (with its offset) or a current directory.
@@ -347,6 +350,143 @@ do_close(int h)
   return 0;
 }
 
+#ifdef P0_TEST_HOOKS
+static int xfer_bad_pid;   // next FS_READ from this client runs the probes
+static int xfer_range_pid; // next FS_READ from this client runs one round
+static uint64 xfer_range_round;
+
+char *sbrk(int);   // ulib.c; user.h cannot be included together with defs.h
+
+#if defined(__riscv)
+// The svc_xfer() prototype takes an int direction, so a 64-bit value would
+// be truncated before the syscall.  Call it directly with a wide a1.
+static int
+svc_xfer_wide(int id, uint64 dir, uint64 caddr, void *buf, int n)
+{
+  register uint64 a0 asm("a0") = (uint64)id;
+  register uint64 a1 asm("a1") = dir;
+  register uint64 a2 asm("a2") = caddr;
+  register uint64 a3 asm("a3") = (uint64)buf;
+  register uint64 a4 asm("a4") = (uint64)n;
+  register uint64 a7 asm("a7") = SYS_svc_xfer;
+
+  asm volatile("ecall" : "+r"(a0)
+               : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7)
+               : "memory");
+  return (int)a0;
+}
+
+// Same, with the length widened as well; sys_svc_xfer reads a4 as uint64.
+static int
+svc_xfer_wide_n(int id, int dir, uint64 caddr, void *buf, uint64 n)
+{
+  register uint64 a0 asm("a0") = (uint64)id;
+  register uint64 a1 asm("a1") = (uint64)dir;
+  register uint64 a2 asm("a2") = caddr;
+  register uint64 a3 asm("a3") = (uint64)buf;
+  register uint64 a4 asm("a4") = n;
+  register uint64 a7 asm("a7") = SYS_svc_xfer;
+
+  asm volatile("ecall" : "+r"(a0)
+               : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7)
+               : "memory");
+  return (int)a0;
+}
+#endif
+
+// Every invalid direction must be rejected before any copy happens.  Return
+// -1 only when all probes are rejected; otherwise a distinct negative value
+// lets the client prove which probe was accepted.
+static int
+bad_xfer_probe(uint64 gaddr)
+{
+  static char badmark[4] = { 'B', 'A', 'D', '!' };
+  long r0, r4, rw = -1;
+  int accepted;
+
+  r0 = svc_xfer(SVC_FS, 99, gaddr, badmark, 0);
+  r4 = svc_xfer(SVC_FS, 99, gaddr, badmark, 4);
+#if defined(__riscv)
+  rw = svc_xfer_wide(SVC_FS, 0x100000000ULL, gaddr, badmark, 4);
+#endif
+  accepted = (r0 != -1) + 2 * (r4 != -1) + 4 * (rw != -1);
+  return accepted ? -1 - accepted : -1;
+}
+
+static void
+range_check(uint64 *bad, int *bit, long got, long want)
+{
+  if(got != want)
+    *bad |= 1ULL << *bit;
+  (*bit)++;
+}
+
+// One round of boundary probes for sys_svc_xfer().  Returns 0 when every
+// probe matched; otherwise a negative value with a deviation bitmask.
+static int
+xfer_range_probe(struct ipcmsg *r)
+{
+  static char A[4] = { 'A', 'B', 'C', 'D' };
+  static char B[4] = { 'E', 'F', 'G', 'H' };
+  static char W[4] = { 'W', 'I', 'D', 'E' };
+  static char S9[9] = { 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I' };
+  char got[4];
+  uint64 bad = 0, g = r->gaddr;
+  int bit = 0;
+
+  if(xfer_range_round == 3){
+    // The client asked to read into a grant whose end wraps 2^64.
+    if(g != 0xFFFFFFFFFFFFFFFCULL || r->glen != 8)
+      return -1;
+    range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_TO_CLIENT, g, A, 4), -1);
+    range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_FROM_CLIENT, g, got, 4), -1);
+  } else if(r->glen == 8){
+    switch(xfer_range_round){
+    case 1:
+      range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_TO_CLIENT, g, A, 4), 0);
+      range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_TO_CLIENT, g + 4, B, 2), 0);
+      range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_FROM_CLIENT, g, got, 4), 0);
+      if(memcmp(got, A, 4) != 0)
+        bad |= 1ULL << bit;
+      bit++;
+      range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_TO_CLIENT, g + 6, got, 2), 0);
+      break;
+    case 2:
+      range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_TO_CLIENT, g, S9, 9), -1);
+      range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_TO_CLIENT, g + 5, B, 4), -1);
+      range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_TO_CLIENT, g + 8, A, 1), -1);
+      range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_TO_CLIENT, g + 8, A, 0), 0);
+      range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_TO_CLIENT, g - 1, A, 0), -1);
+      range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_TO_CLIENT, g - 1, A, 1), -1);
+      range_check(&bad, &bit,
+                  svc_xfer(SVC_FS, XFER_TO_CLIENT, 0xFFFFFFFFFFFFFFFEULL, A, 4), -1);
+      break;
+    case 4:
+      range_check(&bad, &bit, svc_xfer(SVC_FS, XFER_TO_CLIENT, g, A, -1), -1);
+#if defined(__riscv)
+      range_check(&bad, &bit,
+                  svc_xfer_wide_n(SVC_FS, XFER_TO_CLIENT, g, W, 0x100000004ULL), -1);
+      range_check(&bad, &bit,
+                  svc_xfer_wide_n(SVC_FS, XFER_TO_CLIENT, g, A,
+                                  0xFFFFFFFFFFFFFFFFULL), -1);
+#endif
+      break;
+    case 5:
+      range_check(&bad, &bit,
+                  svc_xfer(SVC_FS, XFER_TO_CLIENT, g, (void *)0x40000000, 4), -1);
+      range_check(&bad, &bit,
+                  svc_xfer(SVC_FS, XFER_TO_CLIENT, g, sbrk(0) - 2, 4), -1);
+      break;
+    default:
+      return -1;
+    }
+  } else {
+    return -1;
+  }
+  return bad ? -1 - (int)bad : 0;
+}
+#endif
+
 static long
 do_read(struct ipcmsg *r, int usepos)
 {
@@ -355,6 +495,19 @@ do_read(struct ipcmsg *r, int usepos)
 
   if(f == 0)
     return -1;
+#ifdef P0_TEST_HOOKS
+  if(r->op == FS_READ && xfer_bad_pid != 0 && r->pid == xfer_bad_pid){
+    xfer_bad_pid = 0;
+    return bad_xfer_probe(r->gaddr);
+  }
+  if(r->op == FS_READ && xfer_range_pid != 0 && r->pid == xfer_range_pid){
+    int ret;
+    xfer_range_pid = 0;
+    ret = xfer_range_probe(r);
+    xfer_range_round = 0;
+    return ret;
+  }
+#endif
   ilock(f->ip);
   if(usepos){
     n = vfs_readi(f->ip, 1, r->gaddr, (uint)r->a0, (uint)r->a1);
@@ -432,8 +585,15 @@ static long
 dispatch(struct ipcmsg *r)
 {
   // Resolve relative paths against the calling process's directory.
-  struct fh *c = hget(r->cwd);
-  fs_cwd = c ? c->ip : 0;
+  // A nonzero handle this incarnation does not know is an error, not root.
+  if(r->cwd != 0){
+    struct fh *c = hget(r->cwd);
+    if(c == 0)
+      return -1;
+    fs_cwd = c->ip;
+  } else {
+    fs_cwd = 0;
+  }
 
   r->s1[MAXPATH-1] = 0;
   r->s2[MAXPATH-1] = 0;
@@ -451,6 +611,19 @@ dispatch(struct ipcmsg *r)
   case FS_MKNOD:  return do_mknod(r->s1, r->a0, r->a1);
   case FS_CHDIR:  return do_chdir(r->s1);
   case FS_MOUNT:
+#ifdef P0_TEST_HOOKS
+    // Arm the direction probes for the next read from this client.
+    if(strlen(r->s1) == 11 && strncmp(r->s1, "__xferdir__", 11) == 0){
+      xfer_bad_pid = r->pid;
+      return 0;
+    }
+    // Arm one boundary round; the round number travels in mount's dev arg.
+    if(strlen(r->s1) == 13 && strncmp(r->s1, "__xferrange__", 13) == 0){
+      xfer_range_pid = r->pid;
+      xfer_range_round = r->a0;
+      return 0;
+    }
+#endif
 #ifdef FSSRV_FAULT_INJECT
     // Test hook (tests/fault): a "mount" of the fake type "__crash__"
     // makes the server dereference a null pointer, as a bug would.

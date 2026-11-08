@@ -241,9 +241,9 @@ fault:
 	( \
 		cd "$(XV6_DIR)" && \
 		make ARCH="$(TEST_ARCH)" clean && \
-		make ARCH="$(TEST_ARCH)" kernel/kernel && \
+		make ARCH="$(TEST_ARCH)" KEXTRA=-DP0_TEST_HOOKS kernel/kernel && \
 		rm -f fs.img ext2.img fat32.img && \
-		make ARCH="$(TEST_ARCH)" fs.img \
+		make ARCH="$(TEST_ARCH)" KEXTRA=-DP0_TEST_HOOKS fs.img \
 	) > "$$LOG_DIR/build.log" 2>&1; \
 	printf "%s\n" "$$TEST_NAME" > "$(STATE_FILE)"; \
 	printf "%s\n" "$(TEST_ARCH)" > "$(ARCH_STATE_FILE)"; \
